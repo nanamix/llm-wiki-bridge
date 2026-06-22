@@ -1,0 +1,36 @@
+.llm-wiki-bridge-modal .modal-content {
+  max-width: 720px;
+  width: 90vw;
+}
+
+.llm-wiki-bridge-log {
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 55vh;
+  overflow-y: auto;
+  padding: 10px 12px;
+  margin: 8px 0 12px;
+  border-radius: 6px;
+  background: var(--background-modifier-form-field);
+  border: 1px solid var(--background-modifier-border);
+}
+
+.llm-wiki-bridge-log.is-error {
+  border-color: var(--text-error);
+}
+
+.llm-wiki-bridge-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.llm-wiki-bridge-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin: 6px 0 10px;
+}
