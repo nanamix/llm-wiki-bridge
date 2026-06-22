@@ -5,6 +5,6 @@
   "minAppVersion": "1.4.0",
   "description": "Harness bin/wiki + wiki-now.sh 오케스트레이션 — 전체 정제·Codex CLI 위키 생성·진행 로그 모달.",
   "author": "jyha",
-  "authorUrl": "https://github.com/medi-jyha",
+  "authorUrl": "https://github.com/nanamix",
   "isDesktopOnly": true
 }
