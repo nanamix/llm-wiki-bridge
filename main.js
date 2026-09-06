@@ -3,6 +3,7 @@
 const obsidian = require('obsidian');
 const { spawn, execFile } = require('child_process');
 const fs = require('fs');
+const fsp = fs.promises;
 const path = require('path');
 const os = require('os');
 
@@ -12,6 +13,9 @@ const DEFAULT_SETTINGS = {
   defaultRefineLimit: 3,
   wikiNowRelative: '8000_DEV/8100_Super-Power/8140_llm-wiki-launcher/wiki-now.sh',
 };
+const SETTINGS_SAVE_DEBOUNCE_MS = 500;
+const LOG_SCROLL_DEBOUNCE_MS = 16;
+const MAX_PENDING_CHARS = 64 * 1024;
 
 function expandHome(p) {
   if (!p) return p;
@@ -40,7 +44,16 @@ function buildPathEnv() {
   return [...new Set(parts)].join(':');
 }
 
-function todayJournalInfo(vaultRoot) {
+async function pathExists(targetPath) {
+  try {
+    await fsp.access(targetPath);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function todayJournalInfo(vaultRoot) {
   const now = new Date();
   const y = now.getFullYear();
   const mm = String(now.getMonth() + 1).padStart(2, '0');
@@ -49,13 +62,13 @@ function todayJournalInfo(vaultRoot) {
   const journalDir = path.join(vaultRoot, '0000_JOURNAL', String(y), mm);
   let count = 0;
   try {
-    if (fs.existsSync(journalDir)) {
-      count = fs
-        .readdirSync(journalDir)
-        .filter((f) => f.startsWith(`${today}-`) && f.endsWith('.md')).length;
+    count = (await fsp.readdir(journalDir)).filter(
+      (f) => f.startsWith(`${today}-`) && f.endsWith('.md'),
+    ).length;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      console.error('LLM Wiki Bridge: todayJournalInfo failed', error);
     }
-  } catch (_) {
-    /* ignore */
   }
   return { today, count, journalDir };
 }
@@ -65,6 +78,8 @@ class ProgressModal extends obsidian.Modal {
     super(app);
     this.title = title;
     this.done = false;
+    this.childProcess = null;
+    this.scrollTimer = null;
   }
 
   onOpen() {
@@ -83,7 +98,26 @@ class ProgressModal extends obsidian.Modal {
   append(line) {
     if (!this.logEl) return;
     this.logEl.appendText(`${line}\n`);
-    this.logEl.scrollTop = this.logEl.scrollHeight;
+    this.scheduleScroll();
+  }
+
+  scheduleScroll() {
+    if (!this.logEl || this.scrollTimer !== null) return;
+    this.scrollTimer = setTimeout(() => {
+      this.scrollTimer = null;
+      if (!this.logEl) return;
+      this.logEl.scrollTop = this.logEl.scrollHeight;
+    }, LOG_SCROLL_DEBOUNCE_MS);
+  }
+
+  attachProcess(childProcess) {
+    this.childProcess = childProcess;
+  }
+
+  clearProcess(childProcess) {
+    if (!childProcess || this.childProcess === childProcess) {
+      this.childProcess = null;
+    }
   }
 
   finish(code, isError) {
@@ -94,7 +128,17 @@ class ProgressModal extends obsidian.Modal {
   }
 
   onClose() {
+    if (this.scrollTimer !== null) {
+      clearTimeout(this.scrollTimer);
+      this.scrollTimer = null;
+    }
+    if (this.childProcess && !this.childProcess.killed) {
+      this.childProcess.kill();
+      this.childProcess = null;
+    }
     this.contentEl.empty();
+    this.logEl = null;
+    this.closeBtn = null;
   }
 }
 
@@ -193,8 +237,9 @@ class HarnessExecutor {
   async preflight(requireCodex) {
     const { wikiBin, wikiNow } = this.paths();
     const issues = [];
-    if (!fs.existsSync(wikiBin)) issues.push(`wiki 없음: ${wikiBin}`);
-    if (!fs.existsSync(wikiNow)) issues.push(`wiki-now.sh 없음: ${wikiNow}`);
+    const [hasWikiBin, hasWikiNow] = await Promise.all([pathExists(wikiBin), pathExists(wikiNow)]);
+    if (!hasWikiBin) issues.push(`wiki 없음: ${wikiBin}`);
+    if (!hasWikiNow) issues.push(`wiki-now.sh 없음: ${wikiNow}`);
     if (requireCodex) {
       const codex = await this.which('codex');
       if (!codex) issues.push('codex CLI 없음 — 로그인/설치 확인');
@@ -219,19 +264,29 @@ class HarnessExecutor {
         env: this.baseEnv(),
         shell: false,
       });
+      options.modal?.attachProcess(child);
       let pending = '';
       const flush = (chunk) => {
         pending += chunk;
         const lines = pending.split('\n');
         pending = lines.pop() || '';
+        if (pending.length > MAX_PENDING_CHARS) {
+          const overflow = pending.slice(0, pending.length - MAX_PENDING_CHARS);
+          if (overflow.length) onLine(overflow);
+          pending = pending.slice(-MAX_PENDING_CHARS);
+        }
         for (const line of lines) {
           if (line.length) onLine(line);
         }
       };
       child.stdout.on('data', (d) => flush(d.toString()));
       child.stderr.on('data', (d) => flush(d.toString()));
-      child.on('error', reject);
+      child.on('error', (error) => {
+        options.modal?.clearProcess(child);
+        reject(error);
+      });
       child.on('close', (code) => {
+        options.modal?.clearProcess(child);
         if (pending.trim()) onLine(pending.trim());
         resolve(code ?? 1);
       });
@@ -241,13 +296,13 @@ class HarnessExecutor {
   async runWikiNow(modal) {
     const { wikiNow } = this.paths();
     modal.append('▶ wiki-now.sh (전체 정제)');
-    return this.runStreaming('bash', [wikiNow], {}, (line) => modal.append(line));
+    return this.runStreaming('bash', [wikiNow], { modal }, (line) => modal.append(line));
   }
 
   async runWikiNowSafe(modal) {
     const { wikiNow } = this.paths();
     modal.append('▶ wiki-now.sh --safe');
-    return this.runStreaming('bash', [wikiNow, '--safe'], {}, (line) => modal.append(line));
+    return this.runStreaming('bash', [wikiNow, '--safe'], { modal }, (line) => modal.append(line));
   }
 
   async runRefineScan(modal, limit) {
@@ -257,7 +312,7 @@ class HarnessExecutor {
     return this.runStreaming(
       wikiBin,
       ['refine-scan', '--limit', String(limit), '--agent', agent, '--yes'],
-      {},
+      { modal },
       (line) => modal.append(line),
     );
   }
@@ -282,7 +337,7 @@ class LlmWikiBridgeSettingTab extends obsidian.PluginSettingTab {
           .setValue(this.plugin.settings.harnessRoot)
           .onChange(async (v) => {
             this.plugin.settings.harnessRoot = v;
-            await this.plugin.saveSettings();
+            await this.plugin.scheduleSaveSettings();
           }),
       );
 
@@ -294,7 +349,7 @@ class LlmWikiBridgeSettingTab extends obsidian.PluginSettingTab {
           .setValue(this.plugin.settings.refineAgent)
           .onChange(async (v) => {
             this.plugin.settings.refineAgent = v.trim() || 'codex-cli';
-            await this.plugin.saveSettings();
+            await this.plugin.scheduleSaveSettings();
           }),
       );
 
@@ -307,7 +362,7 @@ class LlmWikiBridgeSettingTab extends obsidian.PluginSettingTab {
             const n = parseInt(v, 10);
             if (Number.isInteger(n) && n >= 1 && n <= 20) {
               this.plugin.settings.defaultRefineLimit = n;
-              await this.plugin.saveSettings();
+              await this.plugin.scheduleSaveSettings();
             }
           }),
       );
@@ -320,7 +375,7 @@ class LlmWikiBridgeSettingTab extends obsidian.PluginSettingTab {
           .setValue(this.plugin.settings.wikiNowRelative)
           .onChange(async (v) => {
             this.plugin.settings.wikiNowRelative = v.trim();
-            await this.plugin.saveSettings();
+            await this.plugin.scheduleSaveSettings();
           }),
       );
 
@@ -369,7 +424,7 @@ class LlmWikiBridgePlugin extends obsidian.Plugin {
   }
 
   async confirm(mode) {
-    const { today, count } = todayJournalInfo(vaultBasePath(this.app));
+    const { today, count } = await todayJournalInfo(vaultBasePath(this.app));
     const limit = this.settings.defaultRefineLimit;
     return new Promise((resolve) => {
       const titles = {
@@ -471,8 +526,39 @@ class LlmWikiBridgePlugin extends obsidian.Plugin {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
   }
 
+  scheduleSaveSettings() {
+    return new Promise((resolve, reject) => {
+      this.pendingSaveWaiters = this.pendingSaveWaiters || [];
+      this.pendingSaveWaiters.push({ resolve, reject });
+      if (this.pendingSaveTimer) clearTimeout(this.pendingSaveTimer);
+      this.pendingSaveTimer = setTimeout(async () => {
+        this.pendingSaveTimer = null;
+        const waiters = this.pendingSaveWaiters.splice(0);
+        try {
+          await this.saveSettings();
+          waiters.forEach(({ resolve: done }) => done());
+        } catch (error) {
+          waiters.forEach(({ reject: fail }) => fail(error));
+        }
+      }, SETTINGS_SAVE_DEBOUNCE_MS);
+    });
+  }
+
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  async onunload() {
+    if (!this.pendingSaveTimer) return;
+    clearTimeout(this.pendingSaveTimer);
+    this.pendingSaveTimer = null;
+    const waiters = this.pendingSaveWaiters?.splice(0) || [];
+    try {
+      await this.saveSettings();
+      waiters.forEach(({ resolve }) => resolve());
+    } catch (error) {
+      waiters.forEach(({ reject }) => reject(error));
+    }
   }
 }
 
