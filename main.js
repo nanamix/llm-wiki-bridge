@@ -8,7 +8,7 @@ const path = require('path');
 const os = require('os');
 
 const DEFAULT_SETTINGS = {
-  harnessRoot: '~/.ai_harness',
+  harnessRoot: '~/.ai-harness',
   refineAgent: 'codex-cli',
   defaultRefineLimit: 3,
   wikiNowRelative: '8000_DEV/8100_Super-Power/8140_llm-wiki-launcher/wiki-now.sh',
@@ -16,6 +16,7 @@ const DEFAULT_SETTINGS = {
 const SETTINGS_SAVE_DEBOUNCE_MS = 500;
 const LOG_SCROLL_DEBOUNCE_MS = 16;
 const MAX_PENDING_CHARS = 64 * 1024;
+const MAX_LOG_CHARS = 256 * 1024;
 
 function expandHome(p) {
   if (!p) return p;
@@ -44,33 +45,46 @@ function buildPathEnv() {
   return [...new Set(parts)].join(':');
 }
 
-async function pathExists(targetPath) {
+async function fileAccessible(targetPath, mode) {
   try {
-    await fsp.access(targetPath);
-    return true;
+    await fsp.access(targetPath, mode);
+    return (await fsp.stat(targetPath)).isFile();
   } catch (_) {
     return false;
   }
 }
 
-async function todayJournalInfo(vaultRoot) {
-  const now = new Date();
+async function todayJournalInfo(vaultRoot, now = new Date()) {
   const y = now.getFullYear();
   const mm = String(now.getMonth() + 1).padStart(2, '0');
   const dd = String(now.getDate()).padStart(2, '0');
   const today = `${y}-${mm}-${dd}`;
-  const journalDir = path.join(vaultRoot, '0000_JOURNAL', String(y), mm);
-  let count = 0;
+  const monthDir = path.join(vaultRoot, '0000_JOURNAL', String(y), mm);
+  // ISO weeks use Thursday to determine their year, including January boundaries.
+  const thursday = new Date(Date.UTC(y, now.getMonth(), now.getDate()));
+  thursday.setUTCDate(thursday.getUTCDate() + 4 - (thursday.getUTCDay() || 7));
+  const yearStart = Date.UTC(thursday.getUTCFullYear(), 0, 1);
+  const week = Math.ceil(((thursday - yearStart) / 86400000 + 1) / 7);
+  const journalDir = path.join(monthDir, `W${String(week).padStart(2, '0')}`, today);
+  const names = new Set();
   try {
-    count = (await fsp.readdir(journalDir)).filter(
-      (f) => f.startsWith(`${today}-`) && f.endsWith('.md'),
-    ).length;
-  } catch (error) {
-    if (error?.code !== 'ENOENT') {
-      console.error('LLM Wiki Bridge: todayJournalInfo failed', error);
+    for (const dir of [journalDir, path.join(monthDir, today), monthDir]) {
+      let entries;
+      try {
+        entries = await fsp.readdir(dir, { withFileTypes: true });
+      } catch (error) {
+        if (error.code === 'ENOENT') continue;
+        throw error;
+      }
+      for (const entry of entries) {
+        const match = entry.name.match(new RegExp(`^${today}-(\\d+)(?:-.*)?\\.md$`));
+        if (entry.isFile() && match && Number(match[1]) > 0) names.add(entry.name);
+      }
     }
+  } catch (error) {
+    return { today, count: null, journalDir, error: error.message };
   }
-  return { today, count, journalDir };
+  return { today, count: names.size, journalDir };
 }
 
 class ProgressModal extends obsidian.Modal {
@@ -98,6 +112,9 @@ class ProgressModal extends obsidian.Modal {
   append(line) {
     if (!this.logEl) return;
     this.logEl.appendText(`${line}\n`);
+    if (this.logEl.textContent.length > MAX_LOG_CHARS) {
+      this.logEl.textContent = this.logEl.textContent.slice(-MAX_LOG_CHARS);
+    }
     this.scheduleScroll();
   }
 
@@ -122,8 +139,9 @@ class ProgressModal extends obsidian.Modal {
 
   finish(code, isError) {
     this.done = true;
-    if (isError) this.logEl?.addClass('is-error');
-    this.append(code === 0 ? '\n✓ 완료' : `\n⚠ 종료 코드: ${code}`);
+    const failed = isError || code !== 0;
+    if (failed) this.logEl?.addClass('is-error');
+    this.append(!failed ? '\n✓ 완료' : `\n⚠ 실행 실패 (종료 코드: ${code})`);
     if (this.closeBtn) this.closeBtn.disabled = false;
   }
 
@@ -157,11 +175,13 @@ class ConfirmRefineModal extends obsidian.Modal {
 
     const body = [];
     if (mode === 'oneshot' || mode === 'full') {
-      body.push(`1단계: 오늘(${today}) 저널 ${count}건 → export→ingest→lint→doctor`);
+      const journalCount = count === null ? '집계 실패' : `${count}건`;
+      body.push(`1단계: 오늘(${today}) 저널 ${journalCount} → export→ingest→lint→doctor`);
+      if (this.opts.journalError) body.push(`저널 집계 오류: ${this.opts.journalError}`);
     }
     if (mode === 'oneshot' || mode === 'refine') {
       body.push(
-        `${mode === 'oneshot' ? '2단계: ' : ''}승격 후보 상위 ${limit}건 → Codex CLI 위키 생성`,
+        `${mode === 'oneshot' ? '2단계: ' : ''}승격 후보 상위 ${limit}건 → ${this.opts.agent} 위키 생성`,
       );
     }
     body.push('건당 LLM API 비용이 발생할 수 있습니다.');
@@ -234,15 +254,28 @@ class HarnessExecutor {
     };
   }
 
-  async preflight(requireCodex) {
-    const { wikiBin, wikiNow } = this.paths();
+  async preflight(mode) {
+    const { harness, wikiBin, wikiNow } = this.paths();
     const issues = [];
-    const [hasWikiBin, hasWikiNow] = await Promise.all([pathExists(wikiBin), pathExists(wikiNow)]);
-    if (!hasWikiBin) issues.push(`wiki 없음: ${wikiBin}`);
-    if (!hasWikiNow) issues.push(`wiki-now.sh 없음: ${wikiNow}`);
-    if (requireCodex) {
-      const codex = await this.which('codex');
-      if (!codex) issues.push('codex CLI 없음 — 로그인/설치 확인');
+    if (!await fileAccessible(wikiBin, fs.constants.X_OK)) {
+      issues.push(`wiki 파일 없음 또는 실행 불가: ${wikiBin}`);
+    }
+    if (mode !== 'refine' && !await fileAccessible(wikiNow, fs.constants.R_OK)) {
+      issues.push(`wiki-now.sh 파일 없음 또는 읽기 불가: ${wikiNow}`);
+    }
+    if (mode === 'refine' || mode === 'oneshot') {
+      const agent = this.plugin.settings.refineAgent;
+      if (!/^[a-z][a-z0-9-]*$/.test(agent)) {
+        issues.push('Refine 에이전트 이름이 올바르지 않습니다');
+      } else {
+        const refiner = path.join(harness, 'wiki', 'ingest', `refine-${agent}.sh`);
+        if (!await fileAccessible(refiner, fs.constants.X_OK)) {
+          issues.push(`지원하지 않거나 실행 불가한 에이전트: ${agent}`);
+        }
+        if (agent === 'codex-cli' && !await this.which('codex')) {
+          issues.push('codex CLI 없음 — 설치와 PATH 확인');
+        }
+      }
     }
     return issues;
   }
@@ -331,7 +364,7 @@ class LlmWikiBridgeSettingTab extends obsidian.PluginSettingTab {
 
     new obsidian.Setting(containerEl)
       .setName('Harness 루트')
-      .setDesc('~/.ai_harness 경로')
+      .setDesc('~/.ai-harness 경로')
       .addText((t) =>
         t
           .setValue(this.plugin.settings.harnessRoot)
@@ -381,10 +414,10 @@ class LlmWikiBridgeSettingTab extends obsidian.PluginSettingTab {
 
     new obsidian.Setting(containerEl)
       .setName('사전 점검')
-      .setDesc('wiki · wiki-now.sh · codex CLI')
+      .setDesc('wiki · wiki-now.sh · 선택한 Refine 에이전트 (로그인 상태는 실행 시 확인)')
       .addButton((b) =>
         b.setButtonText('테스트').setCta().onClick(async () => {
-          const issues = await this.plugin.executor.preflight(true);
+          const issues = await this.plugin.executor.preflight('oneshot');
           if (issues.length === 0) new obsidian.Notice('✓ LLM Wiki Bridge 사전 점검 통과');
           else new obsidian.Notice(`⚠ ${issues.join(' · ')}`, 8000);
         }),
@@ -411,7 +444,7 @@ class LlmWikiBridgePlugin extends obsidian.Plugin {
     });
     this.addCommand({
       id: 'wiki-refine-scan',
-      name: '③ refine-scan 위키 생성 (Codex)',
+      name: '③ refine-scan 위키 생성',
       callback: () => this.runRefineOnly(),
     });
     this.addCommand({
@@ -424,12 +457,12 @@ class LlmWikiBridgePlugin extends obsidian.Plugin {
   }
 
   async confirm(mode) {
-    const { today, count } = await todayJournalInfo(vaultBasePath(this.app));
+    const { today, count, error } = await todayJournalInfo(vaultBasePath(this.app));
     const limit = this.settings.defaultRefineLimit;
     return new Promise((resolve) => {
       const titles = {
         full: '🚀 LLM-Wiki 전체 정제',
-        refine: '🦭 LLM-Wiki 위키 생성 (Codex)',
+        refine: '🦭 LLM-Wiki 위키 생성',
         oneshot: '🚀🦭 전체 정제 + 위키 생성',
       };
       const modal = new ConfirmRefineModal(this.app, {
@@ -437,6 +470,8 @@ class LlmWikiBridgePlugin extends obsidian.Plugin {
         mode,
         today,
         count,
+        journalError: error,
+        agent: this.settings.refineAgent,
         limit,
         onResolve: (ok, n) => resolve({ ok, limit: n }),
       });
@@ -445,7 +480,7 @@ class LlmWikiBridgePlugin extends obsidian.Plugin {
   }
 
   async runSafe() {
-    const issues = await this.executor.preflight(false);
+    const issues = await this.executor.preflight('safe');
     if (issues.length) {
       new obsidian.Notice(`⚠ ${issues.join(' · ')}`, 8000);
       return;
@@ -464,7 +499,7 @@ class LlmWikiBridgePlugin extends obsidian.Plugin {
   async runFull() {
     const { ok } = await this.confirm('full');
     if (!ok) return;
-    const issues = await this.executor.preflight(false);
+    const issues = await this.executor.preflight('full');
     if (issues.length) {
       new obsidian.Notice(`⚠ ${issues.join(' · ')}`, 8000);
       return;
@@ -483,12 +518,12 @@ class LlmWikiBridgePlugin extends obsidian.Plugin {
   async runRefineOnly() {
     const { ok, limit } = await this.confirm('refine');
     if (!ok) return;
-    const issues = await this.executor.preflight(true);
+    const issues = await this.executor.preflight('refine');
     if (issues.length) {
       new obsidian.Notice(`⚠ ${issues.join(' · ')}`, 8000);
       return;
     }
-    const modal = new ProgressModal(this.app, `🦭 위키 생성 (Codex, ${limit}건)`);
+    const modal = new ProgressModal(this.app, `🦭 위키 생성 (${this.settings.refineAgent}, ${limit}건)`);
     modal.open();
     try {
       const code = await this.executor.runRefineScan(modal, limit);
@@ -502,7 +537,7 @@ class LlmWikiBridgePlugin extends obsidian.Plugin {
   async runOneshot() {
     const { ok, limit } = await this.confirm('oneshot');
     if (!ok) return;
-    const issues = await this.executor.preflight(true);
+    const issues = await this.executor.preflight('oneshot');
     if (issues.length) {
       new obsidian.Notice(`⚠ ${issues.join(' · ')}`, 8000);
       return;
@@ -515,7 +550,7 @@ class LlmWikiBridgePlugin extends obsidian.Plugin {
       if (code1 !== 0) modal.append('⚠ 1단계 비정상 종료 — 2단계 계속 시도');
       modal.append('\n══ 2/2 위키 생성 ══');
       const code2 = await this.executor.runRefineScan(modal, limit);
-      modal.finish(code2, code1 !== 0 || code2 !== 0);
+      modal.finish(code1 !== 0 ? code1 : code2, code1 !== 0 || code2 !== 0);
     } catch (e) {
       modal.append(String(e.message || e));
       modal.finish(1, true);
@@ -524,6 +559,9 @@ class LlmWikiBridgePlugin extends obsidian.Plugin {
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    if (this.settings.harnessRoot === '~/.ai_harness') {
+      this.settings.harnessRoot = DEFAULT_SETTINGS.harnessRoot;
+    }
   }
 
   scheduleSaveSettings() {

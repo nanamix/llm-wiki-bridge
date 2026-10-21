@@ -1,21 +1,24 @@
-# Security Policy
+# 보안 정책
 
-## Supported Versions
+## 검토 대상
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
+현재 공개 버전은 `manifest.json`의 `0.1.0`이다. 보안 문제를 제보할 때는
+플러그인 버전과 Obsidian 버전, 운영체제를 함께 기록한다. 수정 일정이나
+응답 기한은 보장하지 않는다.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 5.1.x   | :white_check_mark: |
-| 5.0.x   | :x:                |
-| 4.0.x   | :white_check_mark: |
-| < 4.0   | :x:                |
+## 취약점 제보
 
-## Reporting a Vulnerability
+저장소의 **Security → Report a vulnerability** 기능이 활성화되어 있다면
+비공개 제보를 사용한다. 기능이 없다면 저장소 소유자에게 비공개 연락 경로를
+먼저 요청한다. 공개 이슈에는 취약점 악용 방법, 자격증명, 볼트 원문을 게시하지 않는다.
 
-Use this section to tell people how to report a vulnerability.
+제보에는 영향받는 버전, 재현 절차, 예상 영향, 비식별 로그를 포함한다.
 
-Tell them where to go, how often they can expect to get an update on a
-reported vulnerability, what to expect if the vulnerability is accepted or
-declined, etc.
+## 실행 경계
+
+- Obsidian 데스크톱에서 로컬 `wiki`와 `wiki-now.sh`를 실행한다.
+- 하네스 루트와 런처 경로는 신뢰할 수 있는 로컬 파일로 지정한다.
+- 선택한 Refine 에이전트는 하네스가 제공하는 실행 가능한 스크립트여야 한다.
+- CLI 존재 확인은 로그인이나 외부 API 접근 성공을 보장하지 않는다.
+- 모달의 전체 로그는 최근 256 Ki 문자로 제한한다. 외부 명령이 출력한
+  민감 정보가 로그에 포함될 수 있으므로 공유 전 내용을 확인한다.
