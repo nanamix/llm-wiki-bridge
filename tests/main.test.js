@@ -9,26 +9,40 @@ const { createRequire } = require('node:module');
 const requirePlugin = createRequire(path.join(__dirname, '../main.js'));
 
 class Element {
-  constructor() { this.textContent = ''; this.classes = new Set(); }
+  constructor() { this.textContent = ''; this.classes = new Set(); this.children = []; this.listeners = {}; this.disabled = false; }
   addClass(c) { this.classes.add(c); }
   empty() { this.textContent = ''; }
   setText(s) { this.textContent = s; }
   appendText(s) { this.textContent += s; }
-  createEl() { return new Element(); }
-  addEventListener() {}
+  createEl(tag, opts = {}) {
+    const el = new Element(); el.tag = tag; el.textContent = opts.text || ''; this.children.push(el); return el;
+  }
+  addEventListener(event, fn) { this.listeners[event] = fn; }
+  click() { if (!this.disabled) return this.listeners.click?.(); }
+  toggleClass(name, on) { if (on) this.classes.add(name); else this.classes.delete(name); }
 }
 class Modal {
   constructor() { this.modalEl = new Element(); this.contentEl = new Element(); }
   open() { this.onOpen(); }
   close() { this.onClose(); }
 }
+class Setting {
+  constructor(container) { this.container = container; }
+  setName(name) { this.name = name; return this; }
+  setDesc() { return this; }
+  addText(fn) {
+    const text = { value: '', setValue(v) { this.value = v; return this; },
+      setPlaceholder() { return this; }, onChange(cb) { this.change = cb; return this; } };
+    this.container.children.push(text); fn(text); return this;
+  }
+}
 async function loadPlugin() {
   const source = await fs.readFile(path.join(__dirname, '../main.js'), 'utf8');
   const context = { module: { exports: {} }, console, process, setTimeout, clearTimeout,
     require: (name) => name === 'obsidian'
-      ? { Modal, Plugin: class {}, PluginSettingTab: class {}, FileSystemAdapter: class {}, Notice: class {} }
+      ? { Modal, Plugin: class {}, PluginSettingTab: class {}, Setting, FileSystemAdapter: class {}, Notice: class {} }
       : requirePlugin(name) };
-  vm.runInNewContext(source + '\nmodule.exports = { Plugin: LlmWikiBridgePlugin, HarnessExecutor, ProgressModal, todayJournalInfo };', context);
+  vm.runInNewContext(source + '\nmodule.exports = { Plugin: LlmWikiBridgePlugin, HarnessExecutor, ProgressModal, ConfirmRefineModal, todayJournalInfo };', context);
   return context.module.exports;
 }
 async function fixture(t) {
@@ -186,4 +200,91 @@ test('refine-only 공개 명령은 선택 에이전트와 분리된 점검 모�
   };
   await p.runRefineOnly();
   assert.equal(observed[0], 0); assert.match(observed[1], /deepseek/);
+});
+
+test('선택 날짜를 원샷 양 단계에 동일하게 전달한다', async () => {
+  const { Plugin, ProgressModal } = await loadPlugin(); const p = new Plugin(); p.app = {};
+  p.confirm = async () => ({ ok: true, limit: 4, targetDate: '2026-10-15' });
+  const calls = [];
+  p.executor = { preflight: async () => [], runWikiNow: async (...args) => { calls.push(args.slice(1)); return 0; },
+    runRefineScan: async (...args) => { calls.push(args.slice(1)); return 0; } };
+  ProgressModal.prototype.finish = () => {};
+  await p.runOneshot(); assert.deepEqual(calls, [['2026-10-15'], [4, '2026-10-15']]);
+});
+
+test('확인 모달은 YYYY/MM/DD 날짜를 검증하고 선택일 집계를 기다린다', async () => {
+  const { ConfirmRefineModal } = await loadPlugin(); let confirmed;
+  const m = new ConfirmRefineModal({}, { title: 'test', mode: 'full', today: '2026-10-21', count: 2,
+    limit: 3, agent: 'deepseek', loadJournalInfo: async (date) => ({ count: date === '2026-10-15' ? 8 : 0 }),
+    onResolve: (...args) => { confirmed = args; } });
+  m.open();
+  const input = m.contentEl.children.find((el) => el.value === '2026/10/21');
+  assert.ok(input, '대상 날짜 입력이 있어야 함');
+  const actions = m.contentEl.children.find((el) => el.children?.some((c) => c.textContent === '실행'));
+  const execute = actions.children.find((el) => el.textContent === '실행');
+  await input.change('2026/02/30'); assert.equal(execute.disabled, true);
+  execute.click(); assert.equal(confirmed, undefined);
+  await input.change('2026/10/15'); assert.equal(execute.disabled, false);
+  assert.ok(m.contentEl.children.some((el) => /8건/.test(el.textContent)));
+  execute.click(); assert.deepEqual(confirmed, [true, 3, '2026-10-15']);
+});
+
+test('날짜 재입력 중 늦은 이전 집계가 최신 입력을 덮어쓰지 않는다', async () => {
+  const { ConfirmRefineModal } = await loadPlugin(); let completeOld;
+  const m = new ConfirmRefineModal({}, { title: 'test', mode: 'full', today: '2026-10-21', count: 2,
+    limit: 3, loadJournalInfo: (date) => date === '2026-10-14'
+      ? new Promise((resolve) => { completeOld = resolve; }) : Promise.resolve({ count: 8 }), onResolve: () => {} });
+  m.open(); const input = m.contentEl.children.find((el) => el.value === '2026/10/21'); assert.ok(input);
+  const first = input.change('2026/10/14'); await input.change('2026/10/15');
+  completeOld({ count: 99 }); await first;
+  assert.ok(m.contentEl.children.some((el) => /8건/.test(el.textContent)));
+  assert.ok(!m.contentEl.children.some((el) => /99건/.test(el.textContent)));
+  m.close();
+});
+
+test('날짜 지정 명령은 실제 프로세스 인자에 같은 --date를 넣는다', async (t) => {
+  const { root, executor } = await executorFixture(t, 'deepseek');
+  const launch = await write(root, 'launcher.sh');
+  await fs.writeFile(launch, '#!/bin/sh\nprintf "%s\\n" "$@"\n');
+  await fs.writeFile(path.join(root, 'harness/bin/wiki'), '#!/bin/sh\nprintf "%s\\n" "$@"\n');
+  const lines = []; const modal = { append: (line) => lines.push(line), attachProcess() {}, clearProcess() {} };
+  await executor.runWikiNow(modal, '2026-10-15');
+  assert.deepEqual(lines.slice(1), ['--date', '2026-10-15']);
+  lines.length = 0;
+  await executor.runRefineScan(modal, 4, '2026-10-15');
+  assert.ok(lines.includes('--date')); assert.ok(lines.includes('2026-10-15'));
+  await assert.rejects(executor.runWikiNow(modal, '2026/02/30'), /날짜/);
+});
+
+test('로그 추적을 멈추면 이전 로그의 스크롤 위치를 강제로 바꾸지 않는다', async () => {
+  const { ProgressModal } = await loadPlugin(); const m = new ProgressModal({}, 'test'); m.open();
+  const buttons = m.contentEl.children.flatMap((el) => el.children || []);
+  const follow = buttons.find((el) => /자동 스크롤/.test(el.textContent)); assert.ok(follow);
+  follow.click(); m.logEl.scrollTop = 5; m.logEl.scrollHeight = 999; m.append('추가 로그');
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(m.logEl.scrollTop, 5);
+  follow.click(); await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(m.logEl.scrollTop, 999); m.close();
+});
+
+test('stdout과 stderr의 미완성 줄과 분할 한글을 각각 보존한다', async (t) => {
+  const { executor } = await executorFixture(t); const lines = [];
+  const script = `process.stdout.write('prefix ');
+    const word = Buffer.from('한글'); process.stdout.write(word.subarray(0, 1));
+    setTimeout(() => process.stderr.write('error\\n'), 20);
+    setTimeout(() => { process.stdout.write(word.subarray(1)); process.stdout.write('\\n\\n'); }, 40);`;
+  assert.equal(await executor.runStreaming(process.execPath, ['-e', script], {}, (line) => lines.push(line)), 0);
+  assert.ok(lines.includes('prefix 한글')); assert.ok(lines.includes('error'));
+  assert.ok(lines.includes('')); assert.ok(!lines.some((line) => line.includes('�')));
+});
+
+test('날짜 미지원 하네스로는 과거 날짜 실행을 차단한다', async (t) => {
+  const { root, executor } = await executorFixture(t, 'deepseek'); await write(root, 'launcher.sh');
+  const issues = await executor.preflight('oneshot', '2026-10-15');
+  assert.ok(issues.some((issue) => /날짜/.test(issue)));
+  for (const rel of ['launcher.sh', 'harness/wiki/ingest/rag-intake-router.sh', 'harness/wiki/ingest/refine-scan.sh']) {
+    const file = await write(root, rel); await fs.appendFile(file, '# wiki-bridge: target-date-v1\n');
+  }
+  await write(root, 'harness/wiki/lib/journal_date.py');
+  assert.equal((await executor.preflight('oneshot', '2026-10-15')).length, 0);
 });

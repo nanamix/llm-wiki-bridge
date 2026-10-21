@@ -54,7 +54,20 @@ async function fileAccessible(targetPath, mode) {
   }
 }
 
+function normalizeTargetDate(value) {
+  const match = String(value).trim().match(/^(\d{4})([-/])(\d{2})\2(\d{2})$/);
+  if (!match) throw new Error('날짜는 YYYY/MM/DD 형식으로 입력하세요');
+  const [, year, , month, day] = match;
+  const date = new Date(Number(year), Number(month) - 1, Number(day), 12);
+  if (Number(year) < 1000 || date.getFullYear() !== Number(year)
+      || date.getMonth() + 1 !== Number(month) || date.getDate() !== Number(day)) {
+    throw new Error('유효한 날짜를 입력하세요');
+  }
+  return `${year}-${month}-${day}`;
+}
+
 async function todayJournalInfo(vaultRoot, now = new Date()) {
+  if (typeof now === 'string') now = new Date(`${normalizeTargetDate(now)}T12:00:00`);
   const y = now.getFullYear();
   const mm = String(now.getMonth() + 1).padStart(2, '0');
   const dd = String(now.getDate()).padStart(2, '0');
@@ -94,6 +107,7 @@ class ProgressModal extends obsidian.Modal {
     this.done = false;
     this.childProcess = null;
     this.scrollTimer = null;
+    this.followOutput = true;
   }
 
   onOpen() {
@@ -101,6 +115,21 @@ class ProgressModal extends obsidian.Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl('h3', { text: this.title });
+    const toolbar = contentEl.createEl('div', { cls: 'llm-wiki-bridge-actions' });
+    const follow = toolbar.createEl('button', { text: '자동 스크롤: 켬' });
+    follow.addEventListener('click', () => {
+      this.followOutput = !this.followOutput;
+      follow.setText(`자동 스크롤: ${this.followOutput ? '켬' : '끔'}`);
+      if (this.followOutput) this.scheduleScroll();
+    });
+    const wrap = toolbar.createEl('button', { text: '줄바꿈: 켬' });
+    let wrapped = true;
+    wrap.addEventListener('click', () => {
+      wrapped = !wrapped;
+      this.logEl?.toggleClass('is-nowrap', !wrapped);
+      wrap.setText(`줄바꿈: ${wrapped ? '켬' : '끔'}`);
+    });
+    this.statusEl = contentEl.createEl('p', { cls: 'llm-wiki-bridge-hint', text: '최근 256 Ki 문자 표시 · 창 모서리를 끌어 크기를 조절할 수 있습니다.' });
     this.logEl = contentEl.createEl('div', { cls: 'llm-wiki-bridge-log' });
     this.logEl.setText('시작 중…\n');
     const actions = contentEl.createEl('div', { cls: 'llm-wiki-bridge-actions' });
@@ -114,15 +143,16 @@ class ProgressModal extends obsidian.Modal {
     this.logEl.appendText(`${line}\n`);
     if (this.logEl.textContent.length > MAX_LOG_CHARS) {
       this.logEl.textContent = this.logEl.textContent.slice(-MAX_LOG_CHARS);
+      this.statusEl?.setText('로그가 길어 이전 출력 일부를 생략했습니다. 최근 256 Ki 문자만 표시합니다.');
     }
     this.scheduleScroll();
   }
 
   scheduleScroll() {
-    if (!this.logEl || this.scrollTimer !== null) return;
+    if (!this.logEl || !this.followOutput || this.scrollTimer !== null) return;
     this.scrollTimer = setTimeout(() => {
       this.scrollTimer = null;
-      if (!this.logEl) return;
+      if (!this.logEl || !this.followOutput) return;
       this.logEl.scrollTop = this.logEl.scrollHeight;
     }, LOG_SCROLL_DEBOUNCE_MS);
   }
@@ -157,6 +187,7 @@ class ProgressModal extends obsidian.Modal {
     this.contentEl.empty();
     this.logEl = null;
     this.closeBtn = null;
+    this.statusEl = null;
   }
 }
 
@@ -165,27 +196,24 @@ class ConfirmRefineModal extends obsidian.Modal {
     super(app);
     this.opts = opts;
     this.resolved = false;
+    this.targetDate = opts.today;
+    this.dateValid = !opts.journalError;
+    this.dateRequest = 0;
   }
 
   onOpen() {
-    const { today, count, limit, mode } = this.opts;
+    const { limit, mode } = this.opts;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl('h3', { text: this.opts.title });
-
-    const body = [];
-    if (mode === 'oneshot' || mode === 'full') {
-      const journalCount = count === null ? '집계 실패' : `${count}건`;
-      body.push(`1단계: 오늘(${today}) 저널 ${journalCount} → export→ingest→lint→doctor`);
-      if (this.opts.journalError) body.push(`저널 집계 오류: ${this.opts.journalError}`);
-    }
-    if (mode === 'oneshot' || mode === 'refine') {
-      body.push(
-        `${mode === 'oneshot' ? '2단계: ' : ''}승격 후보 상위 ${limit}건 → ${this.opts.agent} 위키 생성`,
-      );
-    }
-    body.push('건당 LLM API 비용이 발생할 수 있습니다.');
-    contentEl.createEl('p', { text: body.join('\n'), cls: 'llm-wiki-bridge-hint' });
+    new obsidian.Setting(contentEl)
+      .setName('대상 날짜')
+      .setDesc('YYYY/MM/DD · 선택 날짜의 저널만 처리합니다')
+      .addText((t) => t.setValue(this.targetDate.replace(/-/g, '/'))
+        .setPlaceholder('YYYY/MM/DD')
+        .onChange((value) => this.updateTargetDate(value)));
+    this.summaryEl = contentEl.createEl('p', { cls: 'llm-wiki-bridge-hint' });
+    this.renderSummary();
 
     if (mode !== 'full') {
       new obsidian.Setting(contentEl)
@@ -194,7 +222,10 @@ class ConfirmRefineModal extends obsidian.Modal {
           t.setValue(String(limit))
             .onChange((v) => {
               const n = parseInt(String(v).trim(), 10);
-              if (Number.isInteger(n) && n >= 1 && n <= 20) this.opts.limit = n;
+              if (Number.isInteger(n) && n >= 1 && n <= 20) {
+                this.opts.limit = n;
+                this.renderSummary();
+              }
             });
         });
     }
@@ -207,22 +238,54 @@ class ConfirmRefineModal extends obsidian.Modal {
         this.resolve(false);
         this.close();
       });
-    actions
-      .createEl('button', { text: '실행', cls: 'mod-cta' })
-      .addEventListener('click', () => {
-        this.resolved = true;
-        this.resolve(true);
-        this.close();
-      });
+    this.executeBtn = actions.createEl('button', { text: '실행', cls: 'mod-cta' });
+    this.executeBtn.disabled = !this.dateValid;
+    this.executeBtn.addEventListener('click', () => {
+      if (!this.dateValid) return;
+      this.resolved = true;
+      this.resolve(true);
+      this.close();
+    });
+  }
+
+  renderSummary() {
+    const { mode, count, limit, agent, journalError } = this.opts;
+    const lines = [`대상: ${this.targetDate} · 저널 ${count === null ? '집계 실패' : `${count}건`}`];
+    if (mode !== 'refine') lines.push('1단계: 선택 날짜 export → 후보 스캔 → 전체 위키 점검');
+    if (mode !== 'full') lines.push(`${mode === 'oneshot' ? '2단계: ' : ''}같은 날짜의 승격 후보 상위 ${limit}건 → ${agent} 위키 생성`);
+    if (journalError) lines.push(journalError);
+    lines.push('건당 LLM API 비용이 발생할 수 있습니다.');
+    this.summaryEl?.setText(lines.join('\n'));
+  }
+
+  async updateTargetDate(value) {
+    const request = ++this.dateRequest;
+    this.dateValid = false;
+    this.executeBtn.disabled = true;
+    try {
+      const targetDate = normalizeTargetDate(value);
+      this.summaryEl.setText(`${targetDate} 저널 집계 중…`);
+      const info = await this.opts.loadJournalInfo(targetDate);
+      if (request !== this.dateRequest) return;
+      this.targetDate = targetDate;
+      this.opts.count = info.count;
+      this.opts.journalError = info.error;
+      this.dateValid = info.count !== null && !info.error;
+      this.executeBtn.disabled = !this.dateValid;
+      this.renderSummary();
+    } catch (error) {
+      if (request === this.dateRequest) this.summaryEl?.setText(error.message);
+    }
   }
 
   resolve(ok) {
-    if (typeof this.opts.onResolve === 'function') this.opts.onResolve(ok, this.opts.limit);
+    if (typeof this.opts.onResolve === 'function') this.opts.onResolve(ok, this.opts.limit, this.targetDate);
   }
 
   onClose() {
+    this.dateRequest++;
     if (!this.resolved && typeof this.opts.onResolve === 'function') {
-      this.opts.onResolve(false, this.opts.limit);
+      this.opts.onResolve(false, this.opts.limit, this.targetDate);
     }
     this.contentEl.empty();
   }
@@ -254,7 +317,7 @@ class HarnessExecutor {
     };
   }
 
-  async preflight(mode) {
+  async preflight(mode, targetDate) {
     const { harness, wikiBin, wikiNow } = this.paths();
     const issues = [];
     if (!await fileAccessible(wikiBin, fs.constants.X_OK)) {
@@ -275,6 +338,23 @@ class HarnessExecutor {
         if (agent === 'codex-cli' && !await this.which('codex')) {
           issues.push('codex CLI 없음 — 설치와 PATH 확인');
         }
+      }
+    }
+    if (targetDate) {
+      const dateScripts = [path.join(harness, 'wiki', 'ingest', 'rag-intake-router.sh')];
+      if (mode !== 'refine') dateScripts.push(wikiNow);
+      if (mode === 'refine' || mode === 'oneshot') dateScripts.push(path.join(harness, 'wiki', 'ingest', 'refine-scan.sh'));
+      for (const script of dateScripts) {
+        try {
+          if (!(await fsp.readFile(script, 'utf8')).includes('# wiki-bridge: target-date-v1')) {
+            issues.push(`날짜 지정 지원 업데이트 필요: ${path.basename(script)}`);
+          }
+        } catch (_) {
+          issues.push(`날짜 지정 지원 파일을 읽을 수 없음: ${path.basename(script)}`);
+        }
+      }
+      if (!await fileAccessible(path.join(harness, 'wiki', 'lib', 'journal_date.py'), fs.constants.R_OK)) {
+        issues.push('날짜 지정 지원 업데이트 필요: 하네스 저널 선택 도구');
       }
     }
     return issues;
@@ -298,38 +378,39 @@ class HarnessExecutor {
         shell: false,
       });
       options.modal?.attachProcess(child);
-      let pending = '';
-      const flush = (chunk) => {
-        pending += chunk;
-        const lines = pending.split('\n');
-        pending = lines.pop() || '';
-        if (pending.length > MAX_PENDING_CHARS) {
-          const overflow = pending.slice(0, pending.length - MAX_PENDING_CHARS);
+      const pending = { stdout: '', stderr: '' };
+      const flush = (stream, chunk) => {
+        pending[stream] += chunk;
+        const lines = pending[stream].split('\n');
+        pending[stream] = lines.pop() || '';
+        for (const line of lines) onLine(line);
+        if (pending[stream].length > MAX_PENDING_CHARS) {
+          const overflow = pending[stream].slice(0, pending[stream].length - MAX_PENDING_CHARS);
           if (overflow.length) onLine(overflow);
-          pending = pending.slice(-MAX_PENDING_CHARS);
-        }
-        for (const line of lines) {
-          if (line.length) onLine(line);
+          pending[stream] = pending[stream].slice(-MAX_PENDING_CHARS);
         }
       };
-      child.stdout.on('data', (d) => flush(d.toString()));
-      child.stderr.on('data', (d) => flush(d.toString()));
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => flush('stdout', chunk));
+      child.stderr.on('data', (chunk) => flush('stderr', chunk));
       child.on('error', (error) => {
         options.modal?.clearProcess(child);
         reject(error);
       });
       child.on('close', (code) => {
         options.modal?.clearProcess(child);
-        if (pending.trim()) onLine(pending.trim());
+        for (const tail of Object.values(pending)) if (tail.length) onLine(tail);
         resolve(code ?? 1);
       });
     });
   }
 
-  async runWikiNow(modal) {
+  async runWikiNow(modal, targetDate) {
     const { wikiNow } = this.paths();
-    modal.append('▶ wiki-now.sh (전체 정제)');
-    return this.runStreaming('bash', [wikiNow], { modal }, (line) => modal.append(line));
+    const dateArgs = targetDate ? ['--date', normalizeTargetDate(targetDate)] : [];
+    modal.append(`▶ wiki-now.sh (전체 정제) ${dateArgs.join(' ')}`);
+    return this.runStreaming('bash', [wikiNow, ...dateArgs], { modal }, (line) => modal.append(line));
   }
 
   async runWikiNowSafe(modal) {
@@ -338,13 +419,14 @@ class HarnessExecutor {
     return this.runStreaming('bash', [wikiNow, '--safe'], { modal }, (line) => modal.append(line));
   }
 
-  async runRefineScan(modal, limit) {
+  async runRefineScan(modal, limit, targetDate) {
     const { wikiBin } = this.paths();
     const agent = this.plugin.settings.refineAgent;
-    modal.append(`▶ wiki refine-scan --limit ${limit} --agent ${agent}`);
+    const dateArgs = targetDate ? ['--date', normalizeTargetDate(targetDate)] : [];
+    modal.append(`▶ wiki refine-scan --limit ${limit} --agent ${agent} ${dateArgs.join(' ')}`);
     return this.runStreaming(
       wikiBin,
-      ['refine-scan', '--limit', String(limit), '--agent', agent, '--yes'],
+      ['refine-scan', '--limit', String(limit), '--agent', agent, '--yes', ...dateArgs],
       { modal },
       (line) => modal.append(line),
     );
@@ -473,7 +555,8 @@ class LlmWikiBridgePlugin extends obsidian.Plugin {
         journalError: error,
         agent: this.settings.refineAgent,
         limit,
-        onResolve: (ok, n) => resolve({ ok, limit: n }),
+        loadJournalInfo: (date) => todayJournalInfo(vaultBasePath(this.app), date),
+        onResolve: (ok, n, targetDate) => resolve({ ok, limit: n, targetDate }),
       });
       modal.open();
     });
@@ -497,17 +580,17 @@ class LlmWikiBridgePlugin extends obsidian.Plugin {
   }
 
   async runFull() {
-    const { ok } = await this.confirm('full');
+    const { ok, targetDate } = await this.confirm('full');
     if (!ok) return;
-    const issues = await this.executor.preflight('full');
+    const issues = await this.executor.preflight('full', targetDate);
     if (issues.length) {
       new obsidian.Notice(`⚠ ${issues.join(' · ')}`, 8000);
       return;
     }
-    const modal = new ProgressModal(this.app, '🚀 LLM-Wiki 전체 정제');
+    const modal = new ProgressModal(this.app, `🚀 LLM-Wiki 전체 정제 (${targetDate})`);
     modal.open();
     try {
-      const code = await this.executor.runWikiNow(modal);
+      const code = await this.executor.runWikiNow(modal, targetDate);
       modal.finish(code, code !== 0);
     } catch (e) {
       modal.append(String(e.message || e));
@@ -516,17 +599,17 @@ class LlmWikiBridgePlugin extends obsidian.Plugin {
   }
 
   async runRefineOnly() {
-    const { ok, limit } = await this.confirm('refine');
+    const { ok, limit, targetDate } = await this.confirm('refine');
     if (!ok) return;
-    const issues = await this.executor.preflight('refine');
+    const issues = await this.executor.preflight('refine', targetDate);
     if (issues.length) {
       new obsidian.Notice(`⚠ ${issues.join(' · ')}`, 8000);
       return;
     }
-    const modal = new ProgressModal(this.app, `🦭 위키 생성 (${this.settings.refineAgent}, ${limit}건)`);
+    const modal = new ProgressModal(this.app, `🦭 위키 생성 (${targetDate}, ${this.settings.refineAgent}, ${limit}건)`);
     modal.open();
     try {
-      const code = await this.executor.runRefineScan(modal, limit);
+      const code = await this.executor.runRefineScan(modal, limit, targetDate);
       modal.finish(code, code !== 0);
     } catch (e) {
       modal.append(String(e.message || e));
@@ -535,21 +618,21 @@ class LlmWikiBridgePlugin extends obsidian.Plugin {
   }
 
   async runOneshot() {
-    const { ok, limit } = await this.confirm('oneshot');
+    const { ok, limit, targetDate } = await this.confirm('oneshot');
     if (!ok) return;
-    const issues = await this.executor.preflight('oneshot');
+    const issues = await this.executor.preflight('oneshot', targetDate);
     if (issues.length) {
       new obsidian.Notice(`⚠ ${issues.join(' · ')}`, 8000);
       return;
     }
-    const modal = new ProgressModal(this.app, '🚀🦭 전체 정제 + 위키 생성');
+    const modal = new ProgressModal(this.app, `🚀🦭 전체 정제 + 위키 생성 (${targetDate})`);
     modal.open();
     try {
       modal.append('══ 1/2 전체 정제 ══');
-      const code1 = await this.executor.runWikiNow(modal);
+      const code1 = await this.executor.runWikiNow(modal, targetDate);
       if (code1 !== 0) modal.append('⚠ 1단계 비정상 종료 — 2단계 계속 시도');
       modal.append('\n══ 2/2 위키 생성 ══');
-      const code2 = await this.executor.runRefineScan(modal, limit);
+      const code2 = await this.executor.runRefineScan(modal, limit, targetDate);
       modal.finish(code1 !== 0 ? code1 : code2, code1 !== 0 || code2 !== 0);
     } catch (e) {
       modal.append(String(e.message || e));
